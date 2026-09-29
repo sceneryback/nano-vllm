@@ -8,6 +8,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
+    # 指最终的 LM head 怎么选取输出新的 token 以及最多生成多少 token
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
         "introduce yourself",

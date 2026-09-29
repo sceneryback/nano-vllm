@@ -23,11 +23,13 @@ class Block:
         self.token_ids = []
 
 
+# 管理虚拟 kvcache 块
 class BlockManager:
 
     def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
+        # hash 到 block_id 的映射，如果某个 block 的 hash 等于另一个 block，说明这两个 block 前序的所有 tokens 也相同
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
@@ -58,18 +60,26 @@ class BlockManager:
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
         num_cached_blocks = 0
+        # 当前 seq 理论上要分配的 block，实际上没有这么多，因为可以用缓存
         num_new_blocks = seq.num_blocks
+        # 遍历前 n-1 个 block
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
+            # 计算当前 block 的 hash，其中包含了前一个 block 的 hash
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
+            # 之前没有过相同的 block
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 break
+            # 命中的 block
             num_cached_blocks += 1
+            # 该 block id 已经使用，则需要新分配的数量减一
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
+                # 没有足够的空闲 block 分配
         if len(self.free_block_ids) < num_new_blocks:
             return -1
+        # 返回可以缓存的 block 数量
         return num_cached_blocks
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):

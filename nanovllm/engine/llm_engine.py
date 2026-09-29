@@ -22,9 +22,13 @@ class LLMEngine:
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
+        # 为每个 TP 初始化一个 ModelRunner，通常一个 TP 对应一张卡
+        # 从 1号卡开始，0号卡单独拉起
         for i in range(1, config.tensor_parallel_size):
+            # 创建一个跨进程的事件对象，用于进程间同步（一个进程 set，另一个进程 wait）
             event = ctx.Event()
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            # fork 或 spawn 一个新进程，执行 ModelRunner(config, i, event)
             process.start()
             self.ps.append(process)
             self.events.append(event)
@@ -43,12 +47,16 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        # 将 prompt 初始化为 seq，计算 
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
+# 核心逻辑
     def step(self):
+        # 调度一批 prompt
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        # 在 prefill 阶段，是各 seq 的首 token；在 decode 阶段是各 seq 的新生成 token
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
@@ -67,10 +75,12 @@ class LLMEngine:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
+            # 请求添加到 scheduler
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
+            # 单调递增的纳秒级高精度计时器
             t = perf_counter()
             output, num_tokens = self.step()
             if num_tokens > 0:
