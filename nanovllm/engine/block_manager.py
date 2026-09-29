@@ -8,6 +8,7 @@ from nanovllm.engine.sequence import Sequence
 class Block:
 
     def __init__(self, block_id):
+        # 从 0 开始的序号
         self.block_id = block_id
         self.ref_count = 0
         self.hash = -1
@@ -23,11 +24,12 @@ class Block:
         self.token_ids = []
 
 
-# 管理虚拟 kvcache 块
+# 管理逻辑 kvcache 块，相当于 cpu 侧的元数据
 class BlockManager:
 
     def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
+        # num_blocks 在 ModelRunner 中初始化，当前剩余显存能分配多少个 block
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         # hash 到 block_id 的映射，如果某个 block 的 hash 等于另一个 block，说明这两个 block 前序的所有 tokens 也相同
         self.hash_to_block_id: dict[int, int] = dict()
@@ -46,6 +48,7 @@ class BlockManager:
         block_id = self.free_block_ids.popleft()
         block = self.blocks[block_id]
         assert block.ref_count == 0
+        # 不同 block 的 hash 可能相同
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
         block.reset()
@@ -85,6 +88,8 @@ class BlockManager:
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
         h = -1
+        # cached blocks 也可能来自其他 prompt
+        # cached blocks 只可能来自序列的前几个，某个 block 缓存命中，意味着前边的所有 block 都命中了，因为是链式 hash
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
@@ -97,6 +102,7 @@ class BlockManager:
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
+        # 其他 block 新分配
         for i in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size

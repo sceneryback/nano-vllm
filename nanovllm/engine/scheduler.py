@@ -9,8 +9,8 @@ class Scheduler:
 
     def __init__(self, config: Config):
         # 最大并发序列数，就是多少个 prompt，默认 512
-        self.max_num_seqs = config.max_num_seqs，默认 16384
-        # 最大批处理 token 数，和 max_num_seqs 的关系是？
+        self.max_num_seqs = config.max_num_seqs
+        # 最大批处理 token 数，和 max_num_seqs 的关系是？默认 16384
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         # 一个 kv cache block 包含的 token 数，默认 256
