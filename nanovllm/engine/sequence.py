@@ -6,12 +6,18 @@ from nanovllm.sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
+    """请求在调度器中的生命周期状态。"""
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
 
 
 class Sequence:
+    """一条生成请求的 token 状态和 KV Cache 映射。
+
+    ``token_ids`` 最初是 prompt，decode 时不断追加生成 token；``block_table``
+    则把逻辑块号映射到 GPU 物理 KV block id。
+    """
     block_size = 256
     counter = count()
 
@@ -31,6 +37,7 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
 
     def __len__(self):
+        # 使用显式计数而非 len(token_ids)，因为 TP worker 的 decode 副本只传 last_token。
         return self.num_tokens
 
     def __getitem__(self, key):
@@ -56,6 +63,7 @@ class Sequence:
 # 有 @property 后直接像属性一样访问
     @property
     def num_blocks(self):
+        # ceil(num_tokens / block_size)。例：257 tokens、block_size=256 -> 2 blocks。
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
 # 最后一个 block 的 token 数量，总量减去前边 n-1 的总 token 数即可
@@ -77,6 +85,7 @@ class Sequence:
 # pickle.dumps 序列化时调用，决定保存哪些数据
     def __getstate__(self):
         # decode 阶段 KV cache 已在显存中，恢复时只需要最后一个 token 作为下一步的输入，不需要完整列表
+        # prefill 要读取待计算的整段 token；decode 的历史已在 KV cache，只需最后 token。
         last_state = self.last_token if not self.is_prefill else self.token_ids
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
 

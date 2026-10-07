@@ -6,11 +6,15 @@ from nanovllm.engine.block_manager import BlockManager
 
 
 class Scheduler:
+    """在 token 预算和 KV block 预算内组织 prefill/decode 批次。
+
+    调度优先级是 waiting prefill 优先；只有本轮没有 prefill 时才组成 decode batch。
+    """
 
     def __init__(self, config: Config):
         # 最大并发序列数，就是多少个 prompt，默认 512
         self.max_num_seqs = config.max_num_seqs
-        # 最大批处理 token 数，和 max_num_seqs 的关系是？默认 16384
+        # 单次 prefill 的 token 总预算；max_num_seqs 则限制请求条数，两者独立约束。
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         # 一个 kv cache block 包含的 token 数，默认 256
@@ -25,9 +29,11 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        """新请求先进入 FIFO waiting 队列。"""
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
+        """返回本轮序列和阶段标志；True 为 prefill，False 为 decode。"""
         scheduled_seqs = []
         num_batched_tokens = 0
 
@@ -48,7 +54,9 @@ class Scheduler:
             else:
                 # 当前 seq 需要新分配的 token 数
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
+            # 只允许 batch 中第一条序列做 chunked prefill。否则后续大请求会占用
+            # 剩余预算却不能完成，增加状态组合复杂度。
+            if remaining < num_tokens and scheduled_seqs:
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
@@ -63,10 +71,12 @@ class Scheduler:
         if scheduled_seqs:
             return scheduled_seqs, True
 
-        # decode
+        # decode 每条活跃序列本轮只处理一个 token，因此主要受 max_num_seqs 限制。
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
+                # 缺块时从 running 尾部抢占低优先级序列；若只剩自己则抢占自己，
+                # 释放 KV 后回 waiting，未来重新 prefill。
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -78,6 +88,7 @@ class Scheduler:
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
+        # 保持原顺序放回队首；下一轮仍优先推进这批活跃请求。
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
@@ -89,11 +100,13 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+        """提交本轮 KV 进度、追加采样 token，并回收已结束请求。"""
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+                # chunked prefill 尚未覆盖完整 prompt；本轮 logits 不用于生成。
                 continue
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:

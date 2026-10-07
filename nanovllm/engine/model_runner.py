@@ -13,6 +13,11 @@ from nanovllm.utils.loader import load_model
 
 
 class ModelRunner:
+    """单个 TP rank 的 GPU 执行器。
+
+    rank 0 接收 Scheduler 的 Sequence，借共享内存广播控制信息；所有 rank
+    同步执行模型，模型层内部通过 NCCL collective 合并 TP 分片。
+    """
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
@@ -23,8 +28,10 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        # 一进程一 GPU，rank 号同时作为本机 CUDA device id。
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
+        # 构造参数时临时改变默认 device/dtype，避免各层逐个传 device 和 dtype。
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
@@ -40,6 +47,7 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
+                # 1 MiB 控制面缓冲区，只传方法名和 Sequence 元数据，不传模型 tensor。
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
             else:
@@ -48,6 +56,7 @@ class ModelRunner:
                 self.loop()
 
     def exit(self):
+        """各 rank 同步关闭共享内存、CUDA Graph 和 NCCL。"""
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -59,6 +68,7 @@ class ModelRunner:
         dist.destroy_process_group()
 
     def loop(self):
+        """非零 rank 的工作循环，由 rank 0 通过共享内存派发方法调用。"""
         while True:
             method_name, args = self.read_shm()
             self.call(method_name, *args)
@@ -66,14 +76,17 @@ class ModelRunner:
                 break
 
     def read_shm(self):
+        """等待本 rank 的 Event，并反序列化一次远程方法调用。"""
         assert self.world_size > 1 and self.rank > 0
         self.event.wait()
+        # 内存布局：[4-byte payload length][pickle payload]。
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
         self.event.clear()
         return method_name, args
 
     def write_shm(self, method_name, *args):
+        """rank 0 写入调用信息，再用每个 worker 独立的 Event 广播。"""
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
@@ -83,15 +96,18 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
+        """rank 0 先广播再本地执行；worker 只执行本地方法。"""
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
 
     def warmup_model(self):
+        """用最大 token 预算运行一次，测得 forward 临时显存峰值。"""
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
+        # 构造在 token 总量和单序列长度上都尽可能大的合法 batch。
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
@@ -101,6 +117,7 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
+        """用 warmup 后的显存统计计算物理块数量并建立各层 cache 视图。"""
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
@@ -109,9 +126,13 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        # 一个物理 block 横跨所有层；2 表示 K 和 V 两份。TP 后每卡只保存
+        # num_key_value_heads/world_size 个 heads。
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        # peak-current 是 warmup 已释放、正式运行仍可能再次需要的临时显存。
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
+        # 形状：[K/V, layer, physical block, token offset, kv head, head_dim]。
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -121,12 +142,14 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
+        """把不同长度的 Python block_table 右侧补 -1 后搬到 GPU。"""
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        """把多条变长 prompt 压平，并准备 FlashAttention/KV 写入元数据。"""
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -136,21 +159,26 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
+            # cached prefix 不再作为 query；本轮只计算 [start:end)。
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
+            # key 长度包含缓存前缀，所以等于 prompt 中已覆盖到的位置 end。
             seqlen_k = end
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
+            # 例：两条 query 长 3、2 -> [0,3,5]，用于切分扁平 input tensor。
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
+                # warmup 只测模型临时显存，KV cache 尚未创建，因此跳过槽位映射。
                 continue
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
             for i in range(start_block, end_block):
+                # 把逻辑 token 位置转换为扁平物理 slot：block_id*block_size+offset。
                 slot_start = seq.block_table[i] * self.block_size
                 if i == start_block:
                     slot_start += start % self.block_size
@@ -159,7 +187,9 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        # 总 key 数大于新 query 数，说明至少一条序列带缓存前缀；此时 attention
+        # 必须通过 block_tables 从分页 cache 读取完整 K/V。
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -170,14 +200,17 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        """为每条序列准备一个最新 token，并定位其 KV 写入 slot。"""
         input_ids = []
         positions = []
         slot_mapping = []
         context_lens = []
         for seq in seqs:
             input_ids.append(seq.last_token)
+            # token 已在上一轮 postprocess 追加，故其绝对位置是 len(seq)-1。
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
+            # 例：block_id=7、block_size=256、尾块第 4 个 token -> slot=7*256+3。
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -188,21 +221,25 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
+        """把每条请求的 temperature 组成 GPU batch tensor。"""
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        """prefill 使用 eager；常见 decode batch 复用预捕获 CUDA Graph。"""
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
             context = get_context()
+            # 向上取最近的已捕获 batch size，例如 bs=9 使用 graph_bs=16。
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
+            # graph 的 padding 行必须失效，防止 store_kvcache_kernel 写入 slot 0。
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"].zero_()
@@ -212,6 +249,7 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        """所有 rank 执行 forward；只有 rank 0 拼完整 logits 并采样。"""
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
@@ -221,9 +259,11 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        """为常见 decode batch size 捕获静态 CUDA Graph，降低 launch 开销。"""
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
+        # 每条序列 block table 的最大列数，即 ceil(max_model_len/block_size)。
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
@@ -231,10 +271,12 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        # 小 batch 精细分档，大 batch 每 16 一档，控制图数量和 padding 浪费。
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
+        # 从大到小捕获，使 graph pool 先按最大工作集建立并被后续图复用。
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])

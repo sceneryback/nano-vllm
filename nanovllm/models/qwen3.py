@@ -12,6 +12,7 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
 class Qwen3Attention(nn.Module):
+    """Qwen3 的 GQA attention；Q/K/V heads 在 TP ranks 间均匀切分。"""
 
     def __init__(
         self,
@@ -34,6 +35,7 @@ class Qwen3Attention(nn.Module):
         assert self.total_num_kv_heads % tp_size == 0
         self.num_kv_heads = self.total_num_kv_heads // tp_size
         self.head_dim = head_dim or hidden_size // self.total_num_heads
+        # 以下 size 都是当前 rank 的最后一维宽度，而不是全模型宽度。
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
@@ -74,8 +76,11 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # 输入是扁平 token batch：[num_tokens, hidden_size]。
+        # qkv_proj 输出本 rank 的 [Q_local | K_local | V_local]。
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # 恢复 head 维，供 RoPE 和 FlashAttention 使用。
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
@@ -84,11 +89,13 @@ class Qwen3Attention(nn.Module):
             k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
+        # o_proj 是行并行层：先处理本地 heads，再 all-reduce 合并所有 rank。
         output = self.o_proj(o.flatten(1, -1))
         return output
 
 
 class Qwen3MLP(nn.Module):
+    """SwiGLU MLP；gate/up 融合列并行，down 投影行并行。"""
 
     def __init__(
         self,
@@ -118,6 +125,7 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3DecoderLayer(nn.Module):
+    """一个 pre-norm Transformer block，使用融合 residual + RMSNorm。"""
 
     def __init__(
         self,
@@ -150,8 +158,10 @@ class Qwen3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
+            # 第一层还没有独立 residual，保留原始 embedding 作为残差支路。
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
+            # 后续层一次完成 residual += hidden_states 和 RMSNorm(residual)。
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -160,6 +170,7 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3Model(nn.Module):
+    """不含 LM head 的 Qwen3 Transformer 主干。"""
 
     def __init__(
         self,
@@ -184,6 +195,9 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
+    """Qwen3 主干加词表并行 LM head。"""
+
+    # checkpoint 使用分离参数名，而运行时为减少 kernel launch 使用融合参数。
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -200,6 +214,7 @@ class Qwen3ForCausalLM(nn.Module):
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
+            # 输入 embedding 与输出 head 共享同一块本地词表分片存储。
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def forward(
